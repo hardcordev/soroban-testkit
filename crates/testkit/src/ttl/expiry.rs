@@ -22,6 +22,61 @@ pub enum StorageKind {
     Instance,
 }
 
+/// A point-in-time reading of one entry's TTL, taken with
+/// [`TestEnv::ttl_snapshot`] and compared with [`TtlSnapshot::diff`].
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::TestEnv;
+/// use soroban_testkit::ttl::StorageKind;
+/// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+///
+/// #[contract]
+/// struct Store;
+///
+/// #[contractimpl]
+/// impl Store {
+///     pub fn set(env: Env, key: Symbol, value: i128) {
+///         env.storage().persistent().set(&key, &value);
+///     }
+/// }
+///
+/// # fn main() {
+/// let env = TestEnv::new();
+/// let id = env.env().register(Store, ());
+/// StoreClient::new(env.env(), &id).set(&symbol_short!("k"), &1);
+///
+/// let before = env.ttl_snapshot(&id, StorageKind::Persistent, symbol_short!("k"));
+/// env.advance_ledgers(10);
+/// let after = env.ttl_snapshot(&id, StorageKind::Persistent, symbol_short!("k"));
+/// assert_eq!(before.diff(&after), -10);
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TtlSnapshot {
+    kind: StorageKind,
+    ttl: u32,
+}
+
+impl TtlSnapshot {
+    /// The TTL, in ledgers, at the time of the snapshot.
+    pub fn ttl(&self) -> u32 {
+        self.ttl
+    }
+
+    /// The storage kind of the entry that was snapshotted.
+    pub fn kind(&self) -> StorageKind {
+        self.kind
+    }
+
+    /// The signed change in TTL from this snapshot to `later`: positive if
+    /// the TTL grew (an extension), negative if it shrank (ledgers elapsed).
+    pub fn diff(&self, later: &TtlSnapshot) -> i64 {
+        i64::from(later.ttl) - i64::from(self.ttl)
+    }
+}
+
 impl TestEnv {
     /// The current TTL of a storage entry, in ledgers.
     ///
@@ -413,6 +468,146 @@ impl TestEnv {
         }
     }
 
+    /// Assert that the entry at `contract`/`kind`/`key` has a TTL of at
+    /// least `min_ttl` ledgers right now.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] showing the actual
+    /// and minimum TTL if the TTL is lower, and — like
+    /// [`TestEnv::ttl_of`] — if the entry does not exist or has expired.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// StoreClient::new(env.env(), &id).set(&symbol_short!("k"), &1);
+    ///
+    /// env.assert_ttl_at_least(&id, StorageKind::Persistent, symbol_short!("k"), 1);
+    /// # }
+    /// ```
+    pub fn assert_ttl_at_least<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+        min_ttl: u32,
+    ) {
+        let key_val = key.into_val(self.env());
+        let ttl = self.ttl_of_val(contract, kind, &key_val);
+        if ttl < min_ttl {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the {kind:?} TTL to be at least {min_ttl} ledgers, but it is {ttl}"
+                ))
+            );
+        }
+    }
+
+    /// Assert that running `f` changes the TTL of the entry at `contract`/
+    /// `kind`/`key` by exactly `expected_delta` ledgers (after minus
+    /// before).
+    ///
+    /// The delta is signed: a bump is positive, and a closure that only
+    /// advances the ledger yields a negative delta.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] showing the before
+    /// and after TTLs and the actual delta if it differs from
+    /// `expected_delta`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// StoreClient::new(env.env(), &id).set(&symbol_short!("k"), &1);
+    ///
+    /// env.assert_ttl_delta(&id, StorageKind::Persistent, symbol_short!("k"), -5, || {
+    ///     env.advance_ledgers(5);
+    /// });
+    /// # }
+    /// ```
+    pub fn assert_ttl_delta<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+        expected_delta: i64,
+        f: impl FnOnce(),
+    ) {
+        let key_val = key.into_val(self.env());
+        let before = self.ttl_of_val(contract, kind, &key_val);
+        f();
+        let after = self.ttl_of_val(contract, kind, &key_val);
+        let delta = i64::from(after) - i64::from(before);
+        if delta != expected_delta {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the call to change the {kind:?} TTL by {expected_delta} ledgers, \
+                     but it went from {before} to {after} ({delta})"
+                ))
+            );
+        }
+    }
+
+    /// Capture the current TTL of the entry at `contract`/`kind`/`key` as a
+    /// [`TtlSnapshot`], to compare against a later one with
+    /// [`TtlSnapshot::diff`].
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`TestEnv::ttl_of`].
+    ///
+    /// # Example
+    ///
+    /// See [`TtlSnapshot`].
+    pub fn ttl_snapshot<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+    ) -> TtlSnapshot {
+        TtlSnapshot {
+            kind,
+            ttl: self.ttl_of(contract, kind, key),
+        }
+    }
+
     fn ttl_of_val(&self, contract: &Address, kind: StorageKind, key_val: &Val) -> u32 {
         self.env().as_contract(contract, || match kind {
             StorageKind::Temporary => self.env().storage().temporary().get_ttl(key_val),
@@ -562,6 +757,80 @@ mod tests {
         env.assert_no_ttl_bump(&id, StorageKind::Persistent, DataKey::Record, || {
             client.touch_record_checked(); // bumps TTL
         });
+    }
+
+    #[test]
+    fn assert_ttl_at_least_passes_when_ttl_meets_minimum() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        let ttl = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+        env.assert_ttl_at_least(&id, StorageKind::Persistent, DataKey::Record, ttl);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the Persistent TTL to be at least")]
+    fn assert_ttl_at_least_fails_when_ttl_is_below_minimum() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        let ttl = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+        env.assert_ttl_at_least(&id, StorageKind::Persistent, DataKey::Record, ttl + 1);
+    }
+
+    #[test]
+    fn assert_ttl_delta_passes_on_exact_delta() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_ttl_delta(&id, StorageKind::Persistent, DataKey::Record, -10, || {
+            env.advance_ledgers(10);
+        });
+        env.assert_ttl_delta(&id, StorageKind::Persistent, DataKey::Record, 0, || {
+            client.touch_record();
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the call to change the Persistent TTL by 5 ledgers")]
+    fn assert_ttl_delta_fails_on_a_different_delta() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_ttl_delta(&id, StorageKind::Persistent, DataKey::Record, 5, || {
+            client.touch_record(); // reads without bumping
+        });
+    }
+
+    #[test]
+    fn ttl_snapshot_diff_reports_signed_change() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        let before = env.ttl_snapshot(&id, StorageKind::Persistent, DataKey::Record);
+        env.advance_ledgers(10);
+        let aged = env.ttl_snapshot(&id, StorageKind::Persistent, DataKey::Record);
+        client.touch_record_checked();
+        let bumped = env.ttl_snapshot(&id, StorageKind::Persistent, DataKey::Record);
+
+        assert_eq!(before.kind(), StorageKind::Persistent);
+        assert_eq!(before.diff(&aged), -10);
+        assert_eq!(before.diff(&before), 0);
+        assert_eq!(
+            aged.diff(&bumped),
+            i64::from(bumped.ttl()) - i64::from(aged.ttl())
+        );
+        assert!(aged.diff(&bumped) > 0);
     }
 
     #[test]

@@ -6,4 +6,4 @@
 
 mod expiry;
 
-pub use expiry::StorageKind;
+pub use expiry::{StorageKind, TtlSnapshot};
